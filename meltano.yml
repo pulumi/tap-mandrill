@@ -1,0 +1,53 @@
+version: 1
+send_anonymous_usage_stats: true
+project_id: "tap-mandrill"
+default_environment: test
+venv:
+  backend: uv
+environments:
+- name: test
+plugins:
+  extractors:
+  - name: "tap-mandrill"
+    namespace: "tap_mandrill"
+    pip_url: -e .
+    capabilities:
+    - state
+    - catalog
+    - discover
+    - about
+    - stream-maps
+
+    settings:
+    - name: auth_token
+      kind: password
+      label: Mandrill API Key
+      description: The Mandrill API Key used for authentication
+      sensitive: true
+      required: true
+
+    - name: start_date
+      kind: date_iso8601
+      label: Start Date
+      description: Initial date to start extracting activity data from
+      required: false
+
+    - name: api_url
+      kind: string
+      label: API URL
+      description: The Mandrill API base URL
+      required: false
+
+    # Validation rules
+    settings_group_validation:
+    - [auth_token]
+
+    # Default configuration
+    config:
+      api_url: 'https://mandrillapp.com/api/1.0'
+      start_date: '2023-01-01T00:00:00Z'
+
+  loaders:
+  - name: target-jsonl
+    variant: andyh1203
+    pip_url: target-jsonl
