@@ -66,14 +66,20 @@ class ActivityExportStream(MandrillStream):
         now = datetime.datetime.now(datetime.timezone.utc)
         yesterday = now - datetime.timedelta(days=1)
         
+        # Calculate the date 7 days ago to implement the last-week-full-sync logic
+        seven_days_ago = now - datetime.timedelta(days=7)
+        
+        # Determine start date based on state or config
         if bookmark_date:
-            # If we have a bookmark and it's before yesterday, use the bookmark
-            if bookmark_date < yesterday:
-                start_date = bookmark_date
+            # If the bookmark is more recent than seven days ago, 
+            # always fetch the full last 7 days
+            if bookmark_date > seven_days_ago:
+                start_date = seven_days_ago
+                self.logger.info(f"Bookmark is within last 7 days, fetching full week from: {start_date.isoformat()}")
             else:
-                # Otherwise, always use yesterday
-                start_date = yesterday
-                self.logger.info(f"Using yesterday as start date: {start_date.isoformat()}")
+                # Use the bookmark date for older data
+                start_date = bookmark_date
+                self.logger.info(f"Using bookmark date: {start_date.isoformat()}")
         else:
             # Use default from config if no state
             config_start_date = self.config.get("start_date")
@@ -84,32 +90,24 @@ class ActivityExportStream(MandrillStream):
                     start_date = yesterday
                     self.logger.info(f"Config start_date is in the future, using yesterday instead: {start_date.isoformat()}")
             else:
-                # Default to yesterday if no start date is provided
-                start_date = yesterday
-                self.logger.info(f"No start date provided, using yesterday: {start_date.isoformat()}")
+                # Default to 7 days ago if no start date is provided
+                start_date = seven_days_ago
+                self.logger.info(f"No start date provided, using 7 days ago: {start_date.isoformat()}")
                 
-        # End date is always today (current date)
-        end_date = now
+        # End date is always yesterday (to ensure complete data)
+        end_date = yesterday
         self.logger.info(f"Date range: {start_date.isoformat()} to {end_date.isoformat()}")
         
         # Calculate date ranges for processing (divide into daily chunks)
         days_range = []
         
-        # For Mandrill activity export, we always process one day at a time
-        # When no state (first run), process from start_date to yesterday
-        # For incremental runs, process from last state to yesterday
-        
         # Always process from start_date up to yesterday (not including today)
-        # This is because today's data might still be updating
         current_start = start_date
         
-        # Make sure we end at yesterday, not today
-        actual_end_date = yesterday
-        
-        self.logger.info(f"Processing data from {current_start.strftime('%Y-%m-%d')} to {actual_end_date.strftime('%Y-%m-%d')}")
+        self.logger.info(f"Processing data from {current_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         
         # Create daily ranges
-        while current_start <= actual_end_date:
+        while current_start <= end_date:
             # For each day, use the NEXT day as the end date (inclusive range for Mandrill API)
             current_end = current_start + datetime.timedelta(days=1)
             days_range.append((current_start, current_end))
@@ -463,15 +461,21 @@ class ActivityExportStream(MandrillStream):
         self.path = original_path
         self.rest_method = original_method
         
-        # Final state update - always update to yesterday's date
-        # This ensures we don't reprocess the same data again
+        # Final state update - intentionally set bookmark to 7 days ago
+        # This ensures we always reprocess the last 7 days to catch updates
+        seven_days_ago = now - datetime.timedelta(days=7)
+        
         if latest_processed_date:
-            # We already updated during each batch, verify it's not greater than yesterday
-            if latest_processed_date > yesterday:
-                self._write_replication_key_signpost(context=None, value=yesterday.isoformat())
-                self.logger.info(f"Adjusted final state to yesterday's date: {yesterday.isoformat()}")
+            # For any data older than 7 days ago, we can safely use that as bookmark
+            if latest_processed_date < seven_days_ago:
+                self._write_replication_key_signpost(context=None, value=latest_processed_date.isoformat())
+                self.logger.info(f"Updated state to last processed date: {latest_processed_date.isoformat()}")
+            else:
+                # For recent data, always set bookmark to 7 days ago
+                self._write_replication_key_signpost(context=None, value=seven_days_ago.isoformat())
+                self.logger.info(f"Set state to 7 days ago to ensure full week sync: {seven_days_ago.isoformat()}")
         else:
-            # No data was processed, still update state to yesterday to avoid reprocessing
-            self._write_replication_key_signpost(context=None, value=yesterday.isoformat())
-            self.logger.info(f"No data processed, updated state to yesterday's date: {yesterday.isoformat()}")
+            # No data was processed, set state to 7 days ago
+            self._write_replication_key_signpost(context=None, value=seven_days_ago.isoformat())
+            self.logger.info(f"No data processed, set state to 7 days ago: {seven_days_ago.isoformat()}")
 
