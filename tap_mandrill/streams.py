@@ -215,8 +215,8 @@ class ActivityExportStream(MandrillStream):
                 retry_count += 1
                 self.logger.info(f"Export not ready, retrying {retry_count}/{max_retries}")
                 
-                # Wait 30 seconds between retries (increased from 10)
-                time.sleep(30)
+                # Wait 300 seconds between retries (5 minutes)
+                time.sleep(300)
                 
             if not export_complete:
                 self.logger.error(f"Export timed out for batch {date_from} to {date_to}")
