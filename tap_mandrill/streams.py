@@ -37,6 +37,7 @@ class ActivityExportStream(MandrillStream):
         th.Property("sender", th.StringType, description="The sender address"),
         th.Property("subject", th.StringType, description="The subject line"),
         th.Property("status", th.StringType, description="The status of the message"),
+        th.Property("channel", th.StringType, description="The delivery channel (email or sms)"),
         th.Property("tags", th.StringType, description="The tags associated with the message"),
         th.Property("subaccount", th.StringType, description="The subaccount the message belongs to"),
         th.Property("opens", th.IntegerType, description="Number of opens"),
@@ -341,31 +342,45 @@ class ActivityExportStream(MandrillStream):
                 self.logger.info(f"First {len(first_lines)} lines: {first_lines}")
                 
             # Get the CSV headers
-            try:
-                headers = reader.fieldnames
-                self.logger.info(f"CSV headers: {headers}")
-            except Exception as e:
-                self.logger.error(f"Error reading CSV headers: {str(e)}")
-                
+            headers = reader.fieldnames
+            self.logger.info(f"CSV headers: {headers}")
+
             # Convert CSV rows to properly typed records
             row_count = 0
             processed_count = 0
             
-            # CSV field mapping from Mandrill export to our schema
+            # CSV field mapping from Mandrill export to our schema.
+            # NOTE: Mandrill renamed the recipient column "Email Address" -> "Recipient"
+            # and added "Channel" around Oct-Nov 2025. The old guard silently skipped
+            # absent columns, so the rename nulled every recipient with no error.
             field_mapping = {
                 "Message ID": "message_id",
                 "Date": "ts",
-                "Email Address": "email",
+                "Recipient": "email",
                 "Sender": "sender",
                 "Subject": "subject",
                 "Status": "status",
+                "Channel": "channel",
                 "Tags": "tags",
                 "Subaccount": "subaccount",
                 "Opens": "opens",
                 "Clicks": "clicks",
                 "Bounce Detail": "bounce_detail"
             }
-            
+
+            # Fail loud if Mandrill drops or renames a column we depend on, instead
+            # of silently emitting NULLs. Skip the check for an empty export (no
+            # headers), which is a legitimate result for a quiet date range.
+            required_source_columns = ("Message ID", "Date", "Recipient")
+            if headers:
+                missing = [c for c in required_source_columns if c not in headers]
+                if missing:
+                    raise RuntimeError(
+                        f"Mandrill activity export is missing expected column(s) "
+                        f"{missing}; got headers {headers}. The export schema changed "
+                        f"again - update field_mapping in streams.py."
+                    )
+
             for row in reader:
                 row_count += 1
                 
