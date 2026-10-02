@@ -38,6 +38,18 @@ plugins:
       description: The Mandrill API base URL
       required: false
 
+    - name: content_subject_allowlist
+      kind: array
+      label: Content Subject Allowlist
+      description: Regular expressions matched against message subjects. The message_content stream fetches the HTML body only for matching messages. Unset means no content is fetched.
+      required: false
+
+    - name: content_lookback_days
+      kind: integer
+      label: Content Lookback Days
+      description: On the first run of message_content, how many days back to fetch content for
+      required: false
+
     # Validation rules
     settings_group_validation:
     - [auth_token]
