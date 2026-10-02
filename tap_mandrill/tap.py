@@ -35,6 +35,28 @@ class TapMandrill(Tap):
             description="The Mandrill API base URL",
         ),
         th.Property(
+            "content_subject_allowlist",
+            th.ArrayType(th.StringType),
+            title="Content Subject Allowlist",
+            description=(
+                "Regular expressions (case-insensitive) matched against message "
+                "subjects. The message_content stream fetches the HTML body only for "
+                "messages whose subject matches one of them. Leave unset to fetch no "
+                "content; some emails carry account-action links that should not be "
+                "stored."
+            ),
+        ),
+        th.Property(
+            "content_lookback_days",
+            th.IntegerType,
+            title="Content Lookback Days",
+            default=3,
+            description=(
+                "On the first run of the message_content stream, how many days back "
+                "to fetch content for. Later runs continue from the stream's bookmark."
+            ),
+        ),
+        th.Property(
             "user_agent",
             th.StringType(nullable=True),
             description=(
@@ -52,6 +74,7 @@ class TapMandrill(Tap):
         """
         return [
             streams.ActivityExportStream(self),
+            streams.MessageContentStream(self),
         ]
 
 

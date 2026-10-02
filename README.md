@@ -27,6 +27,31 @@ tap-mandrill --about
 | auth_token | True | None | The Mandrill API key used for authentication |
 | start_date | False | None | The earliest record date to sync (ISO format) |
 | api_url | False | https://mandrillapp.com/api/1.0 | The Mandrill API base URL |
+| content_subject_allowlist | False | None | Regular expressions (case-insensitive) matched against message subjects. The `message_content` stream fetches the HTML body only for matching messages. Unset means no content is fetched. |
+| content_lookback_days | False | 3 | On the first run of `message_content`, how many days back to fetch content for |
+
+## Streams
+
+### `activity_export`
+
+One row per sent message, from Mandrill's activity export: recipient, subject, status, opens and clicks. Each run re-reads the last 7 days so opens and clicks stay current.
+
+### `message_content`
+
+The HTML body of sent messages, one record per message (`message_id`, `ts`, `subject`, `from_email`, `html`, `fetched_at`). Mandrill only keeps message content for a limited time, so this stream archives it.
+
+- It is a child of `activity_export`: for each exported message it calls `/messages/content` once.
+- **Nothing is fetched unless `content_subject_allowlist` is set.** Some emails carry links that act on the recipient's account, such as password resets and invitations. Only list subjects that are safe to store.
+- It keeps its own bookmark (`content_fetched_through`, plus the IDs handled at that exact time), so the 7-day re-read of `activity_export` does not refetch content.
+- A message can be emitted more than once, when a run stops after a failure and the next run retries. Deduplicate on `message_id` downstream.
+- A content request that keeps failing does not fail the sync. Content fetching stops for that run, the bookmark stays where it was, and the next run retries.
+
+```json
+{
+  "auth_token": "YOUR_MANDRILL_API_KEY",
+  "content_subject_allowlist": ["^Your Receipt$", "^Your trial ends on .+$"]
+}
+```
 
 ### Configure using environment variables
 

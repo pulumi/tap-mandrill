@@ -6,8 +6,11 @@ import typing as t
 import csv
 import datetime
 import io
+import re
+import time
 from importlib import resources
 
+import requests
 from singer_sdk import typing as th  # JSON Schema typing helpers
 
 from tap_mandrill.client import MandrillStream
@@ -45,6 +48,31 @@ class ActivityExportStream(MandrillStream):
         th.Property("bounce_detail", th.StringType, description="Bounce description if applicable"),
     ).to_dict()
     
+    def generate_child_contexts(
+        self,
+        record: dict,
+        context: dict | None,  # noqa: ARG002
+    ) -> t.Iterable[dict | None]:
+        """Yield a context for each message whose content should be fetched.
+
+        Most rows yield nothing: the content stream only wants messages that match
+        its subject allowlist and that it has not fetched on an earlier run.
+
+        Args:
+            record: An activity export row.
+            context: Stream partition or context dictionary.
+
+        Yields:
+            A context for the ``message_content`` stream.
+        """
+        for child in self.child_streams:
+            if isinstance(child, MessageContentStream) and child.wants(record):
+                yield {
+                    "message_id": record.get("message_id"),
+                    "ts": record.get("ts"),
+                    "subject": record.get("subject") or "",
+                }
+
     def get_records(self, context: dict | None) -> t.Iterable[dict]:
         """Get records from the Mandrill activity export API.
         
@@ -494,3 +522,255 @@ class ActivityExportStream(MandrillStream):
             self._write_replication_key_signpost(context=None, value=seven_days_ago.isoformat())
             self.logger.info(f"No data processed, set state to 7 days ago: {seven_days_ago.isoformat()}")
 
+
+
+class MessageContentStream(MandrillStream):
+    """The rendered HTML of sent messages, one record per message.
+
+    Mandrill only keeps message content for a limited time, so this stream archives
+    it. It is a child of the activity export: for each exported message that matches
+    ``content_subject_allowlist`` and has not been fetched before, it calls
+    ``/messages/content`` once.
+
+    Nothing is fetched unless ``content_subject_allowlist`` is set. Some emails carry
+    links that act on the recipient's account (password resets, invitations), and
+    the allowlist is what keeps those out of the warehouse.
+
+    A message can be emitted more than once, when a run stops fetching after a
+    failure and the next run retries, so consumers should deduplicate on
+    ``message_id``.
+    """
+
+    name = "message_content"
+    path = "/messages/content"
+    rest_method = "POST"
+    parent_stream_type = ActivityExportStream
+    primary_keys: t.ClassVar[list[str]] = ["message_id"]
+    replication_key = None
+    # One bookmark for the whole stream, rather than a state partition per message.
+    state_partitioning_keys: t.ClassVar[list[str]] = []
+
+    # The activity stream re-reads the last 7 days on every run, so this stream keeps
+    # its own bookmark: the newest send time whose content has been fetched, plus
+    # the IDs of the messages handled at exactly that time. Send times have
+    # one-second resolution, so the time alone cannot tell a message that was
+    # already fetched from a new one sent in the same second.
+    STATE_KEY = "content_fetched_through"
+    STATE_IDS_KEY = "content_fetched_ids"
+    GENERATED_ID_PREFIX = "generated-"
+
+    request_timeout_seconds = 30
+    max_attempts = 3
+    retry_wait_seconds = 5
+
+    schema = th.PropertiesList(
+        th.Property("message_id", th.StringType, description="The message ID"),
+        th.Property("ts", th.DateTimeType, description="When the message was sent"),
+        th.Property("subject", th.StringType, description="The subject line"),
+        th.Property("from_email", th.StringType, description="The sender address"),
+        th.Property("html", th.StringType, description="The HTML body as sent"),
+        th.Property("fetched_at", th.DateTimeType, description="When the content was fetched"),
+    ).to_dict()
+
+    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Initialize the stream."""
+        super().__init__(*args, **kwargs)
+        self._allowlist = [
+            re.compile(pattern, re.IGNORECASE)
+            for pattern in self.config.get("content_subject_allowlist") or []
+        ]
+        self._run_started = False
+        self._previous_bookmark: str | None = None
+        self._previous_ids: list[str] = []
+        self._cutoff: datetime.datetime | None = None
+        self._newest_fetched: datetime.datetime | None = None
+        self._newest_ids: set[str] = set()
+        self._seen_message_ids: set[str] = set()
+        self._halted = False
+
+    def _start_run(self) -> None:
+        """Freeze the cutoff for this run from the bookmark the last run left."""
+        if self._run_started:
+            return
+        self._run_started = True
+        self._previous_bookmark = self.stream_state.get(self.STATE_KEY)
+        if self._previous_bookmark:
+            self._cutoff = _parse_timestamp(self._previous_bookmark)
+        if self._cutoff is not None:
+            # Carry the bookmark into this run, so a new message sent in the same
+            # second as the bookmark is added to its IDs rather than replacing them.
+            self._previous_ids = list(self.stream_state.get(self.STATE_IDS_KEY) or [])
+            self._newest_fetched = self._cutoff
+            self._newest_ids = set(self._previous_ids)
+        else:
+            # First run: older content has usually expired from Mandrill already.
+            lookback_days = self.config["content_lookback_days"]
+            self._cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)
+        self.logger.info(f"Fetching content for allowlisted messages sent since {self._cutoff.isoformat()}")
+
+    def wants(self, record: dict) -> bool:
+        """Return whether the content of this activity row should be fetched.
+
+        Args:
+            record: An activity export row.
+
+        Returns:
+            True when the message is allowlisted and not yet fetched.
+        """
+        if not self._allowlist or self._halted:
+            return False
+
+        message_id = record.get("message_id") or ""
+        if not message_id or message_id.startswith(self.GENERATED_ID_PREFIX):
+            return False
+        if message_id in self._seen_message_ids:
+            return False
+
+        subject = " ".join((record.get("subject") or "").split())
+        if not any(pattern.search(subject) for pattern in self._allowlist):
+            return False
+
+        self._start_run()
+        sent_at = _parse_timestamp(record.get("ts"))
+        if sent_at is None or self._cutoff is None or sent_at < self._cutoff:
+            return False
+        # At exactly the bookmark time, only messages not handled before are new.
+        return sent_at > self._cutoff or message_id not in self._previous_ids
+
+    def get_records(self, context: dict | None) -> t.Iterable[dict]:
+        """Fetch the content of the one message named by the parent's context.
+
+        Args:
+            context: The child context built by the activity stream.
+
+        Yields:
+            At most one record, holding the message's HTML.
+        """
+        if not context or self._halted:
+            return
+
+        message_id = context["message_id"]
+        self._seen_message_ids.add(message_id)
+        try:
+            content = self._fetch_content(message_id)
+        except Exception as e:  # noqa: BLE001
+            # Content is an extra. Losing it must not fail the activity export, so stop
+            # fetching for this run and leave the bookmark where the last run put it.
+            # The next run then retries everything this run attempted.
+            self.logger.error(f"Stopping content fetch for this run after message {message_id} failed: {e}")
+            self._halt()
+            return
+
+        self._advance(context["ts"], message_id)
+        if content is None:
+            self.logger.warning(f"Mandrill has no content for message {message_id}, skipping")
+            return
+
+        yield {
+            "message_id": message_id,
+            "ts": context["ts"],
+            "subject": content.get("subject") or context.get("subject") or "",
+            "from_email": content.get("from_email") or "",
+            "html": content["html"],
+            "fetched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+
+    def _fetch_content(self, message_id: str) -> dict | None:
+        """Call ``/messages/content``.
+
+        Args:
+            message_id: The Mandrill message ID.
+
+        Returns:
+            The response body, or None when Mandrill no longer has the content.
+
+        Raises:
+            RuntimeError: When the request keeps failing.
+        """
+        payload = {**(self.prepare_request_payload(None, None) or {}), "id": message_id}
+        url = f"{self.url_base}{self.path}"
+        last_error = "no attempt made"
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=self.http_headers,
+                    timeout=self.request_timeout_seconds,
+                )
+            except requests.RequestException as e:
+                # The exception text can include the request, so log only its type.
+                last_error = type(e).__name__
+            else:
+                body = _json_object(response)
+                if response.ok:
+                    if body is None:
+                        last_error = "response was not a JSON object"
+                    elif not body.get("html"):
+                        return None
+                    else:
+                        return body
+                elif body is not None and body.get("name") == "Unknown_Message":
+                    # Mandrill reports both an unknown ID and expired content this way.
+                    return None
+                else:
+                    last_error = f"HTTP {response.status_code}"
+                    if body is not None and body.get("name"):
+                        last_error += f" ({body['name']})"
+                    retryable = response.status_code == 429 or response.status_code >= 500
+                    if not retryable:
+                        break
+
+            if attempt < self.max_attempts:
+                time.sleep(self.retry_wait_seconds * attempt)
+
+        msg = f"Mandrill content request failed: {last_error}"
+        raise RuntimeError(msg)
+
+    def _advance(self, ts: str, message_id: str) -> None:
+        """Move the bookmark to the newest send time handled so far."""
+        sent_at = _parse_timestamp(ts)
+        if sent_at is None:
+            return
+        if self._newest_fetched is None or sent_at > self._newest_fetched:
+            self._newest_fetched = sent_at
+            self._newest_ids = {message_id}
+        elif sent_at == self._newest_fetched:
+            self._newest_ids.add(message_id)
+        else:
+            return
+        self.stream_state[self.STATE_KEY] = self._newest_fetched.isoformat()
+        self.stream_state[self.STATE_IDS_KEY] = sorted(self._newest_ids)
+
+    def _halt(self) -> None:
+        """Stop fetching for this run and restore the bookmark the run started with."""
+        self._halted = True
+        if self._previous_bookmark:
+            self.stream_state[self.STATE_KEY] = self._previous_bookmark
+            self.stream_state[self.STATE_IDS_KEY] = self._previous_ids
+        else:
+            self.stream_state.pop(self.STATE_KEY, None)
+            self.stream_state.pop(self.STATE_IDS_KEY, None)
+
+
+def _parse_timestamp(value: str | None) -> datetime.datetime | None:
+    """Parse an ISO timestamp, treating a naive value as UTC."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def _json_object(response: requests.Response) -> dict | None:
+    """Return the response body when it is a JSON object, else None."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
