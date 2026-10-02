@@ -42,8 +42,8 @@ The HTML body of sent messages, one record per message (`message_id`, `ts`, `sub
 
 - It is a child of `activity_export`: for each exported message it calls `/messages/content` once.
 - **Nothing is fetched unless `content_subject_allowlist` is set.** Some emails carry links that act on the recipient's account, such as password resets and invitations. Only list subjects that are safe to store.
-- It keeps its own bookmark (`content_fetched_through`), so the 7-day re-read of `activity_export` does not refetch content.
-- A message can be emitted more than once, after a failed run or at the boundary between two runs. Deduplicate on `message_id` downstream.
+- It keeps its own bookmark (`content_fetched_through`, plus the IDs handled at that exact time), so the 7-day re-read of `activity_export` does not refetch content.
+- A message can be emitted more than once, when a run stops after a failure and the next run retries. Deduplicate on `message_id` downstream.
 - A content request that keeps failing does not fail the sync. Content fetching stops for that run, the bookmark stays where it was, and the next run retries.
 
 ```json

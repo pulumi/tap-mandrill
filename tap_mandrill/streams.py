@@ -68,8 +68,8 @@ class ActivityExportStream(MandrillStream):
         for child in self.child_streams:
             if isinstance(child, MessageContentStream) and child.wants(record):
                 yield {
-                    "message_id": record["message_id"],
-                    "ts": record["ts"],
+                    "message_id": record.get("message_id"),
+                    "ts": record.get("ts"),
                     "subject": record.get("subject") or "",
                 }
 
@@ -536,8 +536,9 @@ class MessageContentStream(MandrillStream):
     links that act on the recipient's account (password resets, invitations), and
     the allowlist is what keeps those out of the warehouse.
 
-    A message can be emitted more than once (after a failed run, or at the boundary
-    between two runs), so consumers should deduplicate on ``message_id``.
+    A message can be emitted more than once, when a run stops fetching after a
+    failure and the next run retries, so consumers should deduplicate on
+    ``message_id``.
     """
 
     name = "message_content"
@@ -550,9 +551,12 @@ class MessageContentStream(MandrillStream):
     state_partitioning_keys: t.ClassVar[list[str]] = []
 
     # The activity stream re-reads the last 7 days on every run, so this stream keeps
-    # its own bookmark: the newest send time whose content has been fetched.
+    # its own bookmark: the newest send time whose content has been fetched, plus
+    # the IDs of the messages handled at exactly that time. Send times have
+    # one-second resolution, so the time alone cannot tell a message that was
+    # already fetched from a new one sent in the same second.
     STATE_KEY = "content_fetched_through"
-    DEFAULT_LOOKBACK_DAYS = 3
+    STATE_IDS_KEY = "content_fetched_ids"
     GENERATED_ID_PREFIX = "generated-"
 
     request_timeout_seconds = 30
@@ -577,8 +581,10 @@ class MessageContentStream(MandrillStream):
         ]
         self._run_started = False
         self._previous_bookmark: str | None = None
+        self._previous_ids: list[str] = []
         self._cutoff: datetime.datetime | None = None
         self._newest_fetched: datetime.datetime | None = None
+        self._newest_ids: set[str] = set()
         self._seen_message_ids: set[str] = set()
         self._halted = False
 
@@ -590,9 +596,15 @@ class MessageContentStream(MandrillStream):
         self._previous_bookmark = self.stream_state.get(self.STATE_KEY)
         if self._previous_bookmark:
             self._cutoff = _parse_timestamp(self._previous_bookmark)
-        if self._cutoff is None:
+        if self._cutoff is not None:
+            # Carry the bookmark into this run, so a new message sent in the same
+            # second as the bookmark is added to its IDs rather than replacing them.
+            self._previous_ids = list(self.stream_state.get(self.STATE_IDS_KEY) or [])
+            self._newest_fetched = self._cutoff
+            self._newest_ids = set(self._previous_ids)
+        else:
             # First run: older content has usually expired from Mandrill already.
-            lookback_days = self.config.get("content_lookback_days", self.DEFAULT_LOOKBACK_DAYS)
+            lookback_days = self.config["content_lookback_days"]
             self._cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)
         self.logger.info(f"Fetching content for allowlisted messages sent since {self._cutoff.isoformat()}")
 
@@ -620,7 +632,10 @@ class MessageContentStream(MandrillStream):
 
         self._start_run()
         sent_at = _parse_timestamp(record.get("ts"))
-        return sent_at is not None and self._cutoff is not None and sent_at >= self._cutoff
+        if sent_at is None or self._cutoff is None or sent_at < self._cutoff:
+            return False
+        # At exactly the bookmark time, only messages not handled before are new.
+        return sent_at > self._cutoff or message_id not in self._previous_ids
 
     def get_records(self, context: dict | None) -> t.Iterable[dict]:
         """Fetch the content of the one message named by the parent's context.
@@ -646,7 +661,7 @@ class MessageContentStream(MandrillStream):
             self._halt()
             return
 
-        self._advance(context["ts"])
+        self._advance(context["ts"], message_id)
         if content is None:
             self.logger.warning(f"Mandrill has no content for message {message_id}, skipping")
             return
@@ -713,22 +728,30 @@ class MessageContentStream(MandrillStream):
         msg = f"Mandrill content request failed: {last_error}"
         raise RuntimeError(msg)
 
-    def _advance(self, ts: str) -> None:
+    def _advance(self, ts: str, message_id: str) -> None:
         """Move the bookmark to the newest send time handled so far."""
         sent_at = _parse_timestamp(ts)
         if sent_at is None:
             return
         if self._newest_fetched is None or sent_at > self._newest_fetched:
             self._newest_fetched = sent_at
-            self.stream_state[self.STATE_KEY] = sent_at.isoformat()
+            self._newest_ids = {message_id}
+        elif sent_at == self._newest_fetched:
+            self._newest_ids.add(message_id)
+        else:
+            return
+        self.stream_state[self.STATE_KEY] = self._newest_fetched.isoformat()
+        self.stream_state[self.STATE_IDS_KEY] = sorted(self._newest_ids)
 
     def _halt(self) -> None:
         """Stop fetching for this run and restore the bookmark the run started with."""
         self._halted = True
         if self._previous_bookmark:
             self.stream_state[self.STATE_KEY] = self._previous_bookmark
+            self.stream_state[self.STATE_IDS_KEY] = self._previous_ids
         else:
             self.stream_state.pop(self.STATE_KEY, None)
+            self.stream_state.pop(self.STATE_IDS_KEY, None)
 
 
 def _parse_timestamp(value: str | None) -> datetime.datetime | None:

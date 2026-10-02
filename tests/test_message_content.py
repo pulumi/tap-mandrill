@@ -134,10 +134,45 @@ def test_fetches_each_message_once_across_runs() -> None:
     second_rows = [*first_rows, activity_row("c", "Your Pulumi Receipt", hours_ago(1))]
     records, state = run_tap(second_rows, post, state=state)
 
-    # b sits exactly on the bookmark, so it is fetched again; a is not.
-    assert posted_ids(post) == ["b", "c"]
-    assert [r["message_id"] for r in records] == ["b", "c"]
+    assert posted_ids(post) == ["c"]
+    assert [r["message_id"] for r in records] == ["c"]
     assert content_bookmark(state) == second_rows[2]["ts"]
+
+
+def test_the_newest_message_is_not_refetched_on_later_runs() -> None:
+    post = mock.Mock(side_effect=lambda *_args, **kwargs: content_response(kwargs["json"]["id"]))
+    rows = [activity_row("only", "Your Pulumi Receipt", hours_ago(5))]
+
+    records, state = run_tap(rows, post)
+    assert [r["message_id"] for r in records] == ["only"]
+
+    # No newer allowlisted message arrives, so the bookmark stays on "only".
+    for _ in range(3):
+        post.reset_mock()
+        records, state = run_tap(rows, post, state=state)
+        post.assert_not_called()
+        assert records == []
+        assert content_bookmark(state) == rows[0]["ts"]
+
+
+def test_a_new_message_in_the_same_second_as_the_bookmark_is_fetched() -> None:
+    post = mock.Mock(side_effect=lambda *_args, **kwargs: content_response(kwargs["json"]["id"]))
+    same_second = hours_ago(5)
+    first_rows = [activity_row("first", "Your Pulumi Receipt", same_second)]
+    _, state = run_tap(first_rows, post)
+
+    # The export later gains a second message sent in that same second.
+    post.reset_mock()
+    second_rows = [*first_rows, activity_row("second", "Your Pulumi Receipt", same_second)]
+    records, state = run_tap(second_rows, post, state=state)
+    assert posted_ids(post) == ["second"]
+    assert [r["message_id"] for r in records] == ["second"]
+
+    # Both are now remembered, so neither is fetched again.
+    post.reset_mock()
+    records, state = run_tap(second_rows, post, state=state)
+    post.assert_not_called()
+    assert content_bookmark(state) == same_second
 
 
 def test_order_within_a_run_does_not_matter() -> None:
@@ -178,6 +213,17 @@ def test_expired_content_is_skipped_and_still_bookmarked() -> None:
     assert content_bookmark(state) == rows[0]["ts"]
 
 
+def test_a_response_without_html_is_skipped_and_still_bookmarked() -> None:
+    post = mock.Mock(return_value=FakeResponse(200, {"html": "", "subject": "Your Pulumi Receipt"}))
+    rows = [activity_row("empty", "Your Pulumi Receipt", hours_ago(5))]
+
+    records, state = run_tap(rows, post)
+
+    assert records == []
+    assert post.call_count == 1
+    assert content_bookmark(state) == rows[0]["ts"]
+
+
 def test_retries_transient_failures() -> None:
     post = mock.Mock(
         side_effect=[
@@ -207,7 +253,11 @@ def test_persistent_failure_stops_the_run_and_keeps_the_old_bookmark(previous_bo
         activity_row("bad", "Your Pulumi Receipt", hours_ago(5)),
         activity_row("never-tried", "Your Pulumi Receipt", hours_ago(4)),
     ]
-    state = {"bookmarks": {"message_content": {"content_fetched_through": previous_bookmark}}} if previous_bookmark else None
+    state = (
+        {"bookmarks": {"message_content": {"content_fetched_through": previous_bookmark, "content_fetched_ids": ["earlier"]}}}
+        if previous_bookmark
+        else None
+    )
 
     records, final_state = run_tap(rows, post, state=state)
 
@@ -216,6 +266,8 @@ def test_persistent_failure_stops_the_run_and_keeps_the_old_bookmark(previous_bo
     assert posted_ids(post) == ["ok", "bad", "bad", "bad"]
     # The bookmark does not move, so the next run retries all three.
     assert content_bookmark(final_state) == previous_bookmark
+    bookmark_ids = final_state.get("bookmarks", {}).get("message_content", {}).get("content_fetched_ids")
+    assert bookmark_ids == (["earlier"] if previous_bookmark else None)
 
 
 def test_client_errors_are_not_retried() -> None:
